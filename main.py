@@ -2,7 +2,7 @@ from datetime import datetime
 import os
 import sqlite3
 import time
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import numpy as np
@@ -40,7 +40,7 @@ def init_db():
 
 
 # ==========================================
-# Autenticación básica y detección de accesos sospechosos
+# Autenticación básica y bloqueo por IP tras 3 intentos fallidos
 # ==========================================
 
 dispositivos_autorizados = {
@@ -55,7 +55,7 @@ def registrar_intento(id_dispositivo: str, token: str):
         intentos_fallidos[id_dispositivo] = 0
     intentos_fallidos[id_dispositivo] += 1
 
-    # bloqueo simple
+    # bloqueo simple al llegar a 3 intentos fallidos desde esa IP/dispositivo
     if intentos_fallidos[id_dispositivo] >= 3:
         print(f"Intento fallido para {id_dispositivo}: BLOQUEADO por intentos sospechosos")
 
@@ -65,10 +65,9 @@ def autenticar_dispositivo(id_dispositivo: str, token: str) -> bool:
         print(f"Intento fallido para {id_dispositivo}: BLOQUEADO por intentos sospechosos")
         return False
 
-    if id_dispositivo in dispositivos_autorizados:
-        if dispositivos_autorizados[id_dispositivo] == token:
-            print(f"Acceso permitido a {id_dispositivo}")
-            return True
+    if token in dispositivos_autorizados.values():
+        print(f"Acceso permitido a {id_dispositivo}")
+        return True
 
     # acceso sospechoso
     registrar_intento(id_dispositivo, token)
@@ -97,7 +96,7 @@ modelo = RandomForestClassifier(random_state=42)
 modelo.fit(X, y)
 
 
-def verificar_trafico_ddos(paquetes: int, bytes_enviados: int, volumen: int, conexiones: int, id_dispositivo: str = "sensor_01") -> bool:
+def verificar_trafico_ddos(paquetes: int, bytes_enviados: int, volumen: int, conexiones: int, id_dispositivo: str) -> bool:
     """Devuelve True si el tráfico es NORMAL (0), False si se detecta ATAQUE (1)."""
     nuevo_trafico = np.array([[paquetes, bytes_enviados, volumen, conexiones]])
     predicciones = modelo.predict(nuevo_trafico)
@@ -217,6 +216,10 @@ def inferencia_mamdani(temp_val: float, hum_val: float):
 
 
 def calcular_velocidad_ventilador(temperatura: float, humedad: float) -> str:
+    """
+    Calcula la velocidad requerida del ventilador ('baja', 'media', 'alta')
+    según la temperatura y humedad utilizando lógica difusa (Mamdani).
+    """
     _, categoria, _, _, _ = inferencia_mamdani(temperatura, humedad)
     return categoria
 
@@ -289,37 +292,46 @@ app = FastAPI(
 init_db()
 
 class LecturaSensor(BaseModel):
-    id_dispositivo: str = Field(default="sensor_01", description="ID del dispositivo IoT", example="sensor_01")
     temperatura: float = Field(..., description="Temperatura en °C", example=24.5)
     humedad: float = Field(..., description="Humedad relativa en %", example=55.0)
     key: str = Field(..., description="Clave de acceso (token)", example="clave_secreta")
+    # Características de tráfico de red para detección DDoS (Práctica 5)
     paquetes: int = Field(default=9, description="Número de paquetes enviados/recibidos", example=9)
     bytes_datos: int = Field(default=110, description="Cantidad de datos transmitidos en bytes", example=110)
     volumen_trafico: int = Field(default=5100, description="Volumen de tráfico en el periodo", example=5100)
     conexiones: int = Field(default=2, description="Número de conexiones realizadas", example=2)
 
 @app.post("/datos")
-async def recibir_datos_post(lectura: LecturaSensor):
-    if not autenticar_dispositivo(lectura.id_dispositivo, lectura.key):
-        bloqueado = intentos_fallidos.get(lectura.id_dispositivo, 0) >= 3
+async def recibir_datos_post(lectura: LecturaSensor, request: Request):
+    """
+    Endpoint principal para Arduino mediante POST con cuerpo JSON.
+    Identifica al dispositivo por su dirección IP de origen.
+    Si falla la key del .env 3 veces desde esa IP, queda bloqueada y ya no se acepta ninguna petición.
+    """
+    ip_origen = request.client.host if request.client else "ip_desconocida"
+
+    # Paso 1: Práctica 4 - Autenticación y bloqueo por IP de origen
+    if not autenticar_dispositivo(ip_origen, lectura.key):
+        bloqueado = intentos_fallidos.get(ip_origen, 0) >= 3
         mensaje = (
-            f"Dispositivo {lectura.id_dispositivo} BLOQUEADO por intentos sospechosos"
+            f"Dispositivo ({ip_origen}) BLOQUEADO por intentos sospechosos"
             if bloqueado
-            else f"Acceso denegado a {lectura.id_dispositivo}"
+            else f"Acceso denegado a {ip_origen}"
         )
         return {"status": "error", "mensaje": mensaje}
 
+    # Paso 2: Práctica 5 - Detección de amenazas de red (DDoS)
     es_trafico_normal = verificar_trafico_ddos(
         lectura.paquetes,
         lectura.bytes_datos,
         lectura.volumen_trafico,
         lectura.conexiones,
-        lectura.id_dispositivo
+        ip_origen
     )
     if not es_trafico_normal:
         return {
             "status": "error",
-            "mensaje": f"Dispositivo {lectura.id_dispositivo}: ATAQUE DETECTADO (DDoS)"
+            "mensaje": f"Dispositivo ({ip_origen}): ATAQUE DETECTADO (DDoS)"
         }
 
     velocidad = calcular_velocidad_ventilador(lectura.temperatura, lectura.humedad)
