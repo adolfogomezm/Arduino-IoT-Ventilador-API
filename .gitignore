@@ -25,6 +25,8 @@ __pycache__/
 # IDEs (PyCharm / VS Code)
 .idea/
 .vscode/
+.gemini
+.agents
 
 # Logs y temporales
 *.log

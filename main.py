@@ -5,6 +5,8 @@ import time
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
 
 class Settings(BaseSettings):
     ALLOWED_DEVICE: str
@@ -35,6 +37,80 @@ def init_db():
             conn.execute("ALTER TABLE lecturas ADD COLUMN velocidad_ventilador TEXT NOT NULL DEFAULT 'media'")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON lecturas(timestamp)")
+
+
+# ==========================================
+# Autenticación básica y detección de accesos sospechosos
+# ==========================================
+
+dispositivos_autorizados = {
+    "sensor_01": settings.ALLOWED_DEVICE
+}
+
+intentos_fallidos = {}
+
+
+def registrar_intento(id_dispositivo: str, token: str):
+    if id_dispositivo not in intentos_fallidos:
+        intentos_fallidos[id_dispositivo] = 0
+    intentos_fallidos[id_dispositivo] += 1
+
+    # bloqueo simple
+    if intentos_fallidos[id_dispositivo] >= 3:
+        print(f"Intento fallido para {id_dispositivo}: BLOQUEADO por intentos sospechosos")
+
+
+def autenticar_dispositivo(id_dispositivo: str, token: str) -> bool:
+    if intentos_fallidos.get(id_dispositivo, 0) >= 3:
+        print(f"Intento fallido para {id_dispositivo}: BLOQUEADO por intentos sospechosos")
+        return False
+
+    if id_dispositivo in dispositivos_autorizados:
+        if dispositivos_autorizados[id_dispositivo] == token:
+            print(f"Acceso permitido a {id_dispositivo}")
+            return True
+
+    # acceso sospechoso
+    registrar_intento(id_dispositivo, token)
+    print(f"Acceso denegado a {id_dispositivo}")
+    return False
+
+
+# ==========================================
+# Detección de ataques DDoS con RandomForest
+# ==========================================
+
+# X = características del tráfico
+X = np.array([
+    [10, 100, 5000, 2],    # normal
+    [12, 120, 5200, 2],    # normal
+    [8, 90, 4800, 1],      # normal
+    [2, 5000, 80000, 50],  # ataque
+    [1, 6000, 90000, 60],  # ataque
+    [3, 4500, 70000, 40]   # ataque
+])
+
+# y = etiquetas (0 = normal, 1 = ataque)
+y = np.array([0, 0, 0, 1, 1, 1])
+
+modelo = RandomForestClassifier(random_state=42)
+modelo.fit(X, y)
+
+
+def verificar_trafico_ddos(paquetes: int, bytes_enviados: int, volumen: int, conexiones: int, id_dispositivo: str = "sensor_01") -> bool:
+    """Devuelve True si el tráfico es NORMAL (0), False si se detecta ATAQUE (1)."""
+    nuevo_trafico = np.array([[paquetes, bytes_enviados, volumen, conexiones]])
+    predicciones = modelo.predict(nuevo_trafico)
+
+    for p in predicciones:
+        if p == 0:
+            print(f"Dispositivo {id_dispositivo}: Tráfico NORMAL")
+            return True
+        else:
+            print(f"Dispositivo {id_dispositivo}: ATAQUE DETECTADO")
+            return False
+    return True
+
 
 # ==========================================
 # LÓGICA DIFUSA (SISTEMA DE INFERENCIA MAMDANI)
@@ -141,10 +217,6 @@ def inferencia_mamdani(temp_val: float, hum_val: float):
 
 
 def calcular_velocidad_ventilador(temperatura: float, humedad: float) -> str:
-    """
-    Calcula la velocidad requerida del ventilador ('baja', 'media', 'alta')
-    según la temperatura y humedad utilizando lógica difusa (Mamdani).
-    """
     _, categoria, _, _, _ = inferencia_mamdani(temperatura, humedad)
     return categoria
 
@@ -217,19 +289,38 @@ app = FastAPI(
 init_db()
 
 class LecturaSensor(BaseModel):
+    id_dispositivo: str = Field(default="sensor_01", description="ID del dispositivo IoT", example="sensor_01")
     temperatura: float = Field(..., description="Temperatura en °C", example=24.5)
     humedad: float = Field(..., description="Humedad relativa en %", example=55.0)
-    key: str = Field(..., description="Clave de acceso", example="clave_secreta")
+    key: str = Field(..., description="Clave de acceso (token)", example="clave_secreta")
+    paquetes: int = Field(default=9, description="Número de paquetes enviados/recibidos", example=9)
+    bytes_datos: int = Field(default=110, description="Cantidad de datos transmitidos en bytes", example=110)
+    volumen_trafico: int = Field(default=5100, description="Volumen de tráfico en el periodo", example=5100)
+    conexiones: int = Field(default=2, description="Número de conexiones realizadas", example=2)
 
 @app.post("/datos")
 async def recibir_datos_post(lectura: LecturaSensor):
-    """
-    Endpoint principal para Arduino mediante POST con cuerpo JSON.
-    Ejemplo de JSON:
-    {"temperatura": 25.4, "humedad": 60.2, "key": "clave_secreta"}
-    """
-    if lectura.key != settings.ALLOWED_DEVICE:
-        return {"status": "error", "mensaje": "Clave de acceso inválida"}
+    if not autenticar_dispositivo(lectura.id_dispositivo, lectura.key):
+        bloqueado = intentos_fallidos.get(lectura.id_dispositivo, 0) >= 3
+        mensaje = (
+            f"Dispositivo {lectura.id_dispositivo} BLOQUEADO por intentos sospechosos"
+            if bloqueado
+            else f"Acceso denegado a {lectura.id_dispositivo}"
+        )
+        return {"status": "error", "mensaje": mensaje}
+
+    es_trafico_normal = verificar_trafico_ddos(
+        lectura.paquetes,
+        lectura.bytes_datos,
+        lectura.volumen_trafico,
+        lectura.conexiones,
+        lectura.id_dispositivo
+    )
+    if not es_trafico_normal:
+        return {
+            "status": "error",
+            "mensaje": f"Dispositivo {lectura.id_dispositivo}: ATAQUE DETECTADO (DDoS)"
+        }
 
     velocidad = calcular_velocidad_ventilador(lectura.temperatura, lectura.humedad)
     resultado = guardar_lectura(lectura.temperatura, lectura.humedad, velocidad)
