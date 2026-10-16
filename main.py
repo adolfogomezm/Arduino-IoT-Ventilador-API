@@ -40,38 +40,34 @@ def init_db():
 
 
 # ==========================================
-# Autenticación básica y bloqueo por IP tras 3 intentos fallidos
+# Autenticación básica y detección de accesos sospechosos
 # ==========================================
-
-dispositivos_autorizados = {
-    "sensor_01": settings.ALLOWED_DEVICE
-}
 
 intentos_fallidos = {}
 
 
-def registrar_intento(id_dispositivo: str, token: str):
-    if id_dispositivo not in intentos_fallidos:
-        intentos_fallidos[id_dispositivo] = 0
-    intentos_fallidos[id_dispositivo] += 1
+def registrar_intento(ip_origen: str, token: str):
+    if ip_origen not in intentos_fallidos:
+        intentos_fallidos[ip_origen] = 0
+    intentos_fallidos[ip_origen] += 1
 
-    # bloqueo simple al llegar a 3 intentos fallidos desde esa IP/dispositivo
-    if intentos_fallidos[id_dispositivo] >= 3:
-        print(f"Intento fallido para {id_dispositivo}: BLOQUEADO por intentos sospechosos")
+    # bloqueo simple
+    if intentos_fallidos[ip_origen] >= 3:
+        print(f"Intento fallido para {ip_origen}: BLOQUEADO por intentos sospechosos")
 
 
-def autenticar_dispositivo(id_dispositivo: str, token: str) -> bool:
-    if intentos_fallidos.get(id_dispositivo, 0) >= 3:
-        print(f"Intento fallido para {id_dispositivo}: BLOQUEADO por intentos sospechosos")
+def autenticar_dispositivo(ip_origen: str, token: str) -> bool:
+    if intentos_fallidos.get(ip_origen, 0) >= 3:
+        print(f"Intento fallido para {ip_origen}: BLOQUEADO por intentos sospechosos")
         return False
 
-    if token in dispositivos_autorizados.values():
-        print(f"Acceso permitido a {id_dispositivo}")
+    if token == settings.ALLOWED_DEVICE:
+        print(f"Acceso permitido a {ip_origen}")
         return True
 
     # acceso sospechoso
-    registrar_intento(id_dispositivo, token)
-    print(f"Acceso denegado a {id_dispositivo}")
+    registrar_intento(ip_origen, token)
+    print(f"Acceso denegado a {ip_origen}")
     return False
 
 
@@ -95,18 +91,37 @@ y = np.array([0, 0, 0, 1, 1, 1])
 modelo = RandomForestClassifier(random_state=42)
 modelo.fit(X, y)
 
+# Registro en memoria para inferir el tráfico por IP en una ventana de 10 segundos
+trafico_por_ip = {}
+VENTANA_DDOS_SEGUNDOS = 10
 
-def verificar_trafico_ddos(paquetes: int, bytes_enviados: int, volumen: int, conexiones: int, id_dispositivo: str) -> bool:
-    """Devuelve True si el tráfico es NORMAL (0), False si se detecta ATAQUE (1)."""
-    nuevo_trafico = np.array([[paquetes, bytes_enviados, volumen, conexiones]])
+
+def inferir_y_verificar_ddos(ip_origen: str, tamano_bytes: int) -> bool:
+    ahora = time.time()
+    if ip_origen not in trafico_por_ip:
+        trafico_por_ip[ip_origen] = []
+
+    # Mantener solo las peticiones de los últimos 10 segundos
+    trafico_por_ip[ip_origen] = [
+        (ts, b) for ts, b in trafico_por_ip[ip_origen]
+        if ahora - ts <= VENTANA_DDOS_SEGUNDOS
+    ]
+    trafico_por_ip[ip_origen].append((ahora, tamano_bytes))
+
+    conexiones = len(trafico_por_ip[ip_origen])
+    bytes_totales = sum(b for _, b in trafico_por_ip[ip_origen])
+    volumen_trafico = bytes_totales * 45
+    paquetes = max(1, 12 - conexiones)
+
+    nuevo_trafico = np.array([[paquetes, bytes_totales, volumen_trafico, conexiones]])
     predicciones = modelo.predict(nuevo_trafico)
 
     for p in predicciones:
         if p == 0:
-            print(f"Dispositivo {id_dispositivo}: Tráfico NORMAL")
+            print(f"Dispositivo {ip_origen}: Tráfico NORMAL")
             return True
         else:
-            print(f"Dispositivo {id_dispositivo}: ATAQUE DETECTADO")
+            print(f"Dispositivo {ip_origen}: ATAQUE DETECTADO")
             return False
     return True
 
@@ -294,45 +309,20 @@ init_db()
 class LecturaSensor(BaseModel):
     temperatura: float = Field(..., description="Temperatura en °C", example=24.5)
     humedad: float = Field(..., description="Humedad relativa en %", example=55.0)
-    key: str = Field(..., description="Clave de acceso (token)", example="clave_secreta")
-    # Características de tráfico de red para detección DDoS (Práctica 5)
-    paquetes: int = Field(default=9, description="Número de paquetes enviados/recibidos", example=9)
-    bytes_datos: int = Field(default=110, description="Cantidad de datos transmitidos en bytes", example=110)
-    volumen_trafico: int = Field(default=5100, description="Volumen de tráfico en el periodo", example=5100)
-    conexiones: int = Field(default=2, description="Número de conexiones realizadas", example=2)
+    key: str = Field(..., description="Clave de acceso", example="clave_secreta")
 
 @app.post("/datos")
 async def recibir_datos_post(lectura: LecturaSensor, request: Request):
-    """
-    Endpoint principal para Arduino mediante POST con cuerpo JSON.
-    Identifica al dispositivo por su dirección IP de origen.
-    Si falla la key del .env 3 veces desde esa IP, queda bloqueada y ya no se acepta ninguna petición.
-    """
     ip_origen = request.client.host if request.client else "ip_desconocida"
+    tamano_bytes = len(lectura.model_dump_json().encode("utf-8"))
 
-    # Paso 1: Práctica 4 - Autenticación y bloqueo por IP de origen
+    if not inferir_y_verificar_ddos(ip_origen, tamano_bytes):
+        return {"status": "error", "mensaje": "ATAQUE DETECTADO (DDoS)"}
+
     if not autenticar_dispositivo(ip_origen, lectura.key):
-        bloqueado = intentos_fallidos.get(ip_origen, 0) >= 3
-        mensaje = (
-            f"Dispositivo ({ip_origen}) BLOQUEADO por intentos sospechosos"
-            if bloqueado
-            else f"Acceso denegado a {ip_origen}"
-        )
-        return {"status": "error", "mensaje": mensaje}
-
-    # Paso 2: Práctica 5 - Detección de amenazas de red (DDoS)
-    es_trafico_normal = verificar_trafico_ddos(
-        lectura.paquetes,
-        lectura.bytes_datos,
-        lectura.volumen_trafico,
-        lectura.conexiones,
-        ip_origen
-    )
-    if not es_trafico_normal:
-        return {
-            "status": "error",
-            "mensaje": f"Dispositivo ({ip_origen}): ATAQUE DETECTADO (DDoS)"
-        }
+        if intentos_fallidos.get(ip_origen, 0) >= 3:
+            return {"status": "error", "mensaje": f"IP {ip_origen} BLOQUEADA por intentos sospechosos"}
+        return {"status": "error", "mensaje": "Clave de acceso inválida"}
 
     velocidad = calcular_velocidad_ventilador(lectura.temperatura, lectura.humedad)
     resultado = guardar_lectura(lectura.temperatura, lectura.humedad, velocidad)
